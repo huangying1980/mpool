@@ -32,6 +32,7 @@ int main(void)
         return -1;
     }
     fprintf(stderr, "ptr %p\n", ptr);
+    mpool_release(pool);
 
     return 0;
 }

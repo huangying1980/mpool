@@ -3,6 +3,9 @@ CC := gcc
 VPATH := ./
 AR := ar
 TARGET ?= release
+ifeq ($(AR_FOR_SO), true)
+CFLAGS_AR_FOR_SO := -fPIC
+endif
 
 RELEASE := -mtune=native -march=native -O3 -fomit-frame-pointer -fforce-addr -fivopts -ftree-vectorize -fweb -frename-registers -ftree-loop-linear -fno-bounds-check
 CFLAGS := -Wall -Werror -pthread -Wextra -Warray-bounds -Wstringop-overflow -D_GNU_SOURCE -D_LARGEFILE64_SOURCE -D_FILE_OFFSET_BITS=64
@@ -42,7 +45,7 @@ $(SO_TARGET): $(SO_OBJ)
 	$(CC) $^ -o $@ $(LIB) $(LDFLAGS) -shared $(DEBUG) $(RELEASE)
 
 $(AR_OBJ): %.a.o:%.c
-	$(CC) -c $< -o $@ $(INC) $(CFLAGS) $(VERSION) $(DEBUG) $(RELEASE)
+	$(CC) -c $< -o $@ $(INC) $(CFLAGS) $(CFLAGS_AR_FOR_SO) $(VERSION) $(DEBUG) $(RELEASE)
 
 $(AR_TARGET):$(AR_OBJ)
 	$(AR) rcs $@ $^
