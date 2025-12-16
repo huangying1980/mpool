@@ -14,30 +14,8 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-#if defined (__alpha__) || defined (__ia64__) || defined (__x86_64__) \
-    || defined (_WIN64) || defined (__LP64__) || defined (__LLP64__)
-#   define MPOOL_64BIT
-#endif
 
-#ifndef MPOOL_PATH_MAX
-#   define MPOOL_PATH_MAX (4096)
-#endif
-
-#ifndef MPOOL_HUGEPAGE_ENV
-#   define MPOOL_HUGEPAGE_ENV "MPOOL_HUGEPAGE_HOME"
-#endif
-
-#ifndef MPOOL_HUGEPAGE_FILE
-#   define MPOOL_HUGEPAGE_FILE "mpool_hugepage"
-#endif
-
-#ifdef MPOOL_ENABLE_MLOCK
-#   define MMEM_LOCK(_addr, _sz) mlock((_addr), (_sz))    
-#   define MMEM_UNLOCK(_addr, _sz) munlock((_addr), (_sz))    
-#else
-#   define MMEM_LOCK(_addr, _sz) do{}while(0)
-#   define MMEM_UNLOCK(_addr, _sz) do{}while(0) 
-#endif
+#define GCC_VER (__GNUC__ * 10000 + __GNUC_MINOR__ * 100 + __GNUC_PATCHLEVEL__)
 
 #if defined MPOOL_DEBUG
 #   define MDBG(format, args...) \
@@ -117,6 +95,41 @@ abort()
 
 #endif
 
+#define MPOOL_UNUSED(_sym) _sym __attribute__((unused))
+
+#if defined (__alpha__) || defined (__ia64__) || defined (__x86_64__) \
+    || defined (_WIN64) || defined (__LP64__) || defined (__LLP64__)
+#   define MPOOL_64BIT
+#endif
+
+#ifndef MPOOL_PATH_MAX
+#   define MPOOL_PATH_MAX (4096)
+#endif
+
+#ifndef MPOOL_HUGEPAGE_ENV
+#   define MPOOL_HUGEPAGE_ENV "MPOOL_HUGEPAGE_HOME"
+#endif
+
+#ifndef MPOOL_HUGEPAGE_FILE
+#   define MPOOL_HUGEPAGE_FILE "mpool_hugepage"
+#endif
+
+#ifdef MPOOL_ENABLE_MLOCK
+#   define MMEM_LOCK(_addr, _sz) mlock((_addr), (_sz))    
+#   define MMEM_UNLOCK(_addr, _sz) munlock((_addr), (_sz))    
+#else
+#   define MMEM_LOCK(_addr, _sz) do{}while(0)
+#   define MMEM_UNLOCK(_addr, _sz) do{}while(0) 
+#endif
+
+#ifndef MPOOL_SIZE_ENV
+#   define MPOOL_SIZE_ENV "MPOOL_MT_SIZE"
+#endif
+
+#ifndef MPOO_MT_DEFAULT_SIZE
+#   define MPOOL_MT_DEFAULT_SIZE (1ul << 21)
+#endif
+
 #define MCACHE_LINE (64u)
 #define MPAGE_SIZE  (4096u)
 
@@ -162,23 +175,44 @@ MSTATIC_CHECK(sizeof(size_t) * CHAR_BIT <= 64);
 MSTATIC_CHECK(sizeof(unsigned int) * CHAR_BIT >= MLL_IDX_CNT);
 MSTATIC_CHECK(MALIGN_SIZE == MBLOCK_SIZE_SMALL / MLL_IDX_CNT);
 
+#ifdef MPOOL_MT
+static __thread struct mpool* tpool = NULL;
+#endif
 
+struct mslice;
 struct mblock {
-    struct mblock*    prev_block;
-    size_t            size;
-    struct mblock*    prev_free;
-    struct mblock*    next_free;
+    struct mblock*      prev_block;
+
+#ifdef MPOOL_MT
+    struct mslice*      owner;  
+#endif
+
+    size_t              size;
+    struct mblock*      prev_free;
+    struct mblock*      next_free;
 };
 
 
 struct mslice {
-    size_t              size;
-    struct mslice*      next;
+    size_t                          size;
+    struct mslice*                  next;
+
+#ifdef MPOOL_MT
+    struct mpool*                   owner;
+    volatile struct mblock*         free_list;
+#endif
+
 };
 
+struct control {
+    struct mblock       empty_block;
+    unsigned int        el_bitmap;
+    unsigned int        ll_bitmap[MEL_IDX_CNT];
+    struct mblock*      blocks[MEL_IDX_CNT][MLL_IDX_CNT]; 
+};
 
 struct mpool {
-    struct mslice*      head;
+    struct mslice*      slice_head;
     size_t              slice_size;
     struct mblock       empty_block;
     unsigned int        el_bitmap;
@@ -190,7 +224,13 @@ struct mpool {
 #define MOFFSETOF(TYPE, MEMBER) ((size_t) &((TYPE *)0)->MEMBER)
 static const size_t MBLOCK_FREE_BIT = 1;
 static const size_t MBLOCK_PREV_FREE_BIT = 2;
+
+#ifdef MPOOL_MT
+static const size_t MBLOCK_OVERHEAD = sizeof(size_t) + sizeof(struct mslice *);
+#else
 static const size_t MBLOCK_OVERHEAD = sizeof(size_t);
+#endif
+
 static const size_t MBLOCK_START_OFFSET = MOFFSETOF(struct mblock, size) + sizeof(size_t);
 static const size_t MBLOCK_SIZE_MIN = sizeof(struct mblock) - sizeof(struct mblock *);
 static const size_t MBLOCK_SIZE_MAX = (size_t)1 << MEL_IDX_MAX;
@@ -202,8 +242,8 @@ static const size_t MBLOCK_SIZE_MAX = (size_t)1 << MEL_IDX_MAX;
 
 #define MBLOCK_SET_SIZE(_b, _s)\
 do {\
-    const size_t size = MBLOCK(_b, 0)->size;\
-    MBLOCK(_b, 0)->size = (_s) | (size & (MBLOCK_FREE_BIT | MBLOCK_PREV_FREE_BIT));\
+    const size_t _oldsize = MBLOCK(_b, 0)->size;\
+    MBLOCK(_b, 0)->size = (_s) | (_oldsize & (MBLOCK_FREE_BIT | MBLOCK_PREV_FREE_BIT));\
 } while (0)
 
 #define MBLOCK_IS_LAST(_b) (!BLOCK_GET_SIZE(_b))
@@ -252,6 +292,11 @@ static void mblock_remove_free(struct mpool* pool, struct mblock* block,
     size_t el, size_t ll);
 static void mblock_insert(struct mpool* pool, struct mblock* block);
 static struct mblock* mblock_link_next(struct mblock* block);
+
+#ifdef MPOOL_MT
+static inline size_t mblock_free_collect(void);
+static inline void mblock_push_remote(struct mblock* block);
+#endif
 
 struct mpool* mpool_create(size_t size)
 {
@@ -304,7 +349,7 @@ void mpool_release(struct mpool* pool)
         return;
     }
 
-    for (slice = mpool->head; slice; slice = next) {
+    for (slice = mpool->slice_head; slice; slice = next) {
         next = slice->next;
         mslice_release(slice);
     }
@@ -400,14 +445,17 @@ static int mslice_add(struct mpool* pool, struct mslice* slice)
         return -1;
     }
 
-    slice->next = pool->head;
-    pool->head = slice;
+    slice->next = pool->slice_head;
+    pool->slice_head = slice;
 
+#ifdef MPOOL_MT
+    block = MBLOCK(addr, -MBLOCK_OVERHEAD + sizeof(struct mslice *));
+#else
     block = MBLOCK(addr, -MBLOCK_OVERHEAD);
+#endif
     MBLOCK_SET_SIZE(block, available); 
     MBLOCK_SET_FREE(block);
     MBLOCK_PREV_SET_USED(block);
-    MDBG("call mblock_insert");
     mblock_insert(pool, block);
 
     next = mblock_link_next(block);
@@ -415,8 +463,200 @@ static int mslice_add(struct mpool* pool, struct mslice* slice)
     MBLOCK_SET_USED(next); 
     MBLOCK_PREV_SET_FREE(next);
 
+#ifdef MPOOL_MT
+    slice->owner = pool;
+    slice->free_list = NULL;
+    block->owner = slice;
+    next->owner = slice;
+#endif
+
+    MDBG("block %p, prev %p", block, block->prev_block); 
     return 0;
 }
+
+static inline void mblock_free(struct mpool* pool, struct mblock* block)
+{
+    mblock_mark_free(block);
+    block = mblock_join_prev(pool, block);
+    block = mblock_join_next(pool, block);
+    mblock_insert(pool, block);
+    MDBG("block %p, prev %p", block, block->prev_block);
+}
+
+#ifdef MPOOL_MT
+void mpool_cleanup_mt(void)
+{
+    mpool_release(tpool);
+}
+
+static size_t mpool_getsize(void)
+{
+    char*   env = getenv(MPOOL_SIZE_ENV);
+    long    size;
+
+    if (!env) {
+        return MPOOL_MT_DEFAULT_SIZE;
+    }
+    size = atol(env);
+    if (size <= 0) {
+        return MPOOL_MT_DEFAULT_SIZE;
+    }
+    
+    return (size_t)size;
+}
+
+void* mpool_alloc_mt(size_t size)
+{
+    struct mblock*  block = NULL;
+    size_t          req_size;
+    size_t          slice_size;
+
+    if (!tpool) {
+        slice_size = mpool_getsize();
+        tpool = mpool_create(slice_size);
+        if (!tpool) {
+            MERR("mpool creat failed");
+            return NULL;
+        }
+        MDBG("slice_size %lu, tpool %p", slice_size, tpool);
+    }
+    req_size = mblock_request_size(size, MALIGN_SIZE);
+    block = mblock_find_free(tpool, req_size);
+    if (!block) {
+        MWARN("slow path, collect free blocks for req_size %lu", req_size);
+        if (mblock_free_collect() >= req_size) {
+            block = mblock_find_free(tpool, req_size);
+            if (block) {
+                goto MBLOCK_READY_USED; 
+            }
+        }
+
+        slice_size = tpool->slice_size;
+        if (slice_size < req_size) {
+            slice_size = req_size << 1;
+
+        }
+        MWARN("slow path, mpool extend size %lu", slice_size);
+        struct mslice* slice = mslice_create(slice_size);
+        if (!slice) {
+            return NULL;
+        }
+        mslice_add(tpool, slice);
+        block = mblock_find_free(tpool, req_size);
+    }
+
+MBLOCK_READY_USED:
+    return mblock_ready_used(tpool, block, req_size);
+}
+
+void mpool_free_mt(void* ptr)
+{
+    struct mblock* block;
+    struct mslice* slice;
+
+    if (ptr) {
+        block = MBLOCK_FROM_ADDR(ptr);
+        slice = block->owner;
+        if (slice->owner == tpool) {
+            MDBG("free local block %p", block);
+            mblock_free(tpool, block);
+        } else {
+            MDBG("push remote free list block %p", block);
+            mblock_push_remote(block);
+        }
+    }
+}
+
+void* mpool_alloc_align_mt(size_t size, size_t align)
+{
+    struct mblock*  block = NULL;
+    struct mslice*  slice = NULL;
+    size_t          req_size;
+    size_t          total_size;
+    size_t          aligned_size;
+    size_t          act_size;
+    size_t          gap;
+    size_t          gap_remain;
+    size_t          offset;
+    size_t          slice_size;
+    void*           ptr;
+    void*           aligned;
+    void*           next_aligned;
+
+    if (!tpool) {
+        slice_size = mpool_getsize();
+        tpool = mpool_create(slice_size);
+        if (!tpool) {
+            MERR("mpool creat failed");
+            return NULL;
+        }
+    }
+
+    req_size = mblock_request_size(size, MALIGN_SIZE);
+    total_size = req_size + align + sizeof(struct mblock);
+    aligned_size = mblock_request_size(total_size, align);
+    act_size = (req_size && align > MALIGN_SIZE) ?  aligned_size : req_size;
+
+    block = mblock_find_free(tpool, act_size);
+    if (!block) {
+        if (mblock_free_collect() >= req_size) {
+            block = mblock_find_free(tpool, req_size);
+            if (block) {
+                goto MBLOCK_READY_USED; 
+            }
+        }
+        slice_size = tpool->slice_size;
+        if (slice_size < act_size) {
+            slice_size = act_size << 1;
+        }
+        MWARN("slow path, mpool extend size %lu", slice_size);
+        slice = mslice_create(slice_size);
+        if (!slice) {
+            return NULL;
+        }
+        mslice_add(tpool, slice);
+        block = mblock_find_free(tpool, act_size);
+    }
+
+MBLOCK_READY_USED:
+    ptr = MBLOCK_TO_ADDR(block);    
+    aligned = (void *)MSIZE_ALIGN_UP(ptr, align);
+    gap = aligned - ptr;
+    if (gap && gap < sizeof(struct mblock)) {
+        gap_remain = sizeof(struct mblock) - gap; 
+        offset = gap_remain > align ? gap_remain : align;
+        next_aligned = aligned + offset;
+        aligned = (void *)MSIZE_ALIGN_UP(next_aligned, align);
+        gap = aligned - ptr;
+    }
+    if (gap) {
+        block = mblock_trim_free(tpool, block, gap);
+     }
+
+    return mblock_ready_used(tpool, block, req_size);
+}
+
+void* mpool_calloc_mt(size_t size)
+{
+    void* addr = mpool_alloc_mt(size);
+
+    if (addr) {
+        memset(addr, 0, size);
+    }
+
+    return addr;
+}
+
+void* mpool_calloc_align_mt(size_t size, size_t align)
+{
+    void* addr = mpool_alloc_align_mt(size, align);
+    if (addr) {
+        memset(addr, 0, size);
+    }
+
+    return addr;
+}
+#endif
 
 void* mpool_alloc(struct mpool* pool, size_t size)
 {
@@ -425,7 +665,6 @@ void* mpool_alloc(struct mpool* pool, size_t size)
     size_t          slice_size;
 
     req_size = mblock_request_size(size, MALIGN_SIZE);
-    MDBG("call mblock_find_free");
     block = mblock_find_free(pool, req_size);
     if (!block) {
         slice_size = pool->slice_size;
@@ -451,10 +690,7 @@ void mpool_free(struct mpool* pool, void* ptr)
 
     if (ptr) {
         block = MBLOCK_FROM_ADDR(ptr);
-        mblock_mark_free(block);
-        block = mblock_join_prev(pool, block);
-        block = mblock_join_next(pool, block);
-        mblock_insert(pool, block);
+        mblock_free(pool, block);
     }
 }
 
@@ -508,6 +744,7 @@ void* mpool_alloc_align(struct mpool* pool, size_t size, size_t align)
         block = mblock_trim_free(pool, block, gap);
      }
 
+    MDBG("block %p, prev %p", block, block->prev_block);
     return mblock_ready_used(pool, block, req_size);
 }
 
@@ -576,8 +813,7 @@ static int mprepare_hugepage(size_t* size)
 }
 
 
-#if defined (__GNUC__) && (__GNUC__ > 3 || (__GNUC__ == 3 && __GNUC_MINOR__ >= 4)) \
-    && defined (__GNUC_PATCHLEVEL__)
+#if GCC_VER >= 30400
 
 static inline int m_ffs(unsigned int word)
 {
@@ -806,10 +1042,13 @@ static struct mblock* mblock_split(struct mblock* block, size_t size)
 
     remain_block = MBLOCK(MBLOCK_TO_ADDR(block), size - MBLOCK_OVERHEAD);
     remain_size = MBLOCK_GET_SIZE(block) - (size + MBLOCK_OVERHEAD);
-
     MBLOCK_SET_SIZE(remain_block, remain_size);
+    MBLOCK_SET_SIZE(block, size);
     mblock_mark_free(remain_block);
 
+#ifdef MPOOL_MT
+    remain_block->owner = block->owner;
+#endif
     return remain_block;
 }
 
@@ -817,6 +1056,7 @@ static void mblock_trim(struct mpool* pool, struct mblock* block,
     size_t size)
 {
     struct mblock* remain;
+    MDBG("block %p, prev %p", block, block->prev_block);
     if (MBLOCK_CAN_SPLIT(block, size)) {
         remain = mblock_split(block, size);
         mblock_link_next(block);
@@ -883,6 +1123,129 @@ static struct mblock* mblock_join_next(struct mpool* pool, struct mblock* block)
 
     return block;
 }
+
+#ifdef MPOOL_MT
+#   if GCC_VER >= 40700
+#       define mpool_atomic_exchange __atomic_exchange_n
+#       define mpool_atomic_cas __atomic_compare_exchange_n
+#   else  //GCC_VER
+#       if defined(__x86_64__) || defined(__i386__)
+static inline void* mpool_atomic_exchange(void **addr, void *newv, int MPOOL_UNUSED(morder))
+{
+    void* old;
+    __asm__ __volatile__ (
+        "xchgq %0, %1"
+        : "=r" (old), "+m" (*addr)
+        : "0" (newv)
+        : "memory"
+    );
+    return old;
+}
+
+static inline int mpool_atomic_cas(void* volatile* ptr, void** expected,
+    void* desired, int MPOOL_UNUSED(flag), int MPOOL_UNUSED(success_morder),
+    int MPOOL_UNUSED(fail_morder))
+{
+    unsigned char success;
+
+    __asm__ __volatile__(
+        "lock cmpxchgq %3, %1\n"
+        "sete %0\n"
+        : "=r"(success),
+          "+m"(*ptr),
+          "+a"(*expected)
+        : "r"(desired)
+        : "memory", "cc"
+    );
+
+    return !!success;
+}
+
+#       elif defined(__aarch64__) // __x86_64__
+static inline void* mpool_atomic_exchange(void **addr, void *newv, int MPOOL_UNUSED(morder))
+{
+    void *old;
+    unsigned int tmp;
+    __asm__ __volatile__ (
+        "0:\n"
+        "ldaxr   %0, [%2]\n"
+        "stlxr   %w1, %3, [%2]\n"
+        "cbnz    %w1, 0b\n"
+        : "=&r" (old), "=&r" (tmp)
+        : "r" (addr), "r" (newv)
+        : "memory"
+    );
+    return old;
+}
+static inline int mpool_atomic_cas(void* volatile* ptr, void** expected, 
+    void* desired, int MPOOL_UNUSED(flag), int MPOOL_UNUSED(success_morder),
+    int MPOOL_UNUSED(fail_morder))
+{
+    uint64_t old;
+    uint32_t fail;
+
+    __asm__ __volatile__(
+        "ldxr    %0, [%2]\n"
+        "cmp     %0, %3\n"
+        "b.ne    1f\n"
+        "stxr    %w1, %4, [%2]\n"
+        "b       2f\n"
+        "1:\n"
+        "mov     %w1, #1\n"
+        "2:\n"
+        : "=&r"(old), "=&r"(fail)
+        : "r"(ptr), "r"(*expected), "r"(desired)
+        : "memory", "cc"
+    );
+
+    if (fail != 0) {
+        *expected = (void*)old;
+        return 0;
+    }
+
+    return 1;
+}
+
+#       else //__x86_64__
+#           error "atomic_exchange_ptr: unsupported architecture"
+#       endif //_x86_64__
+
+#   endif //GCC_VER
+
+static inline size_t mblock_free_collect(void)
+{
+    struct mslice*  slice;
+    struct mblock*  head;
+    struct mblock*  block;
+    struct mblock*  next;
+    size_t          size = 0;
+    
+    for (slice = tpool->slice_head; slice; slice = slice->next) {
+        head = (struct mblock *)mpool_atomic_exchange(&slice->free_list, NULL,
+            __ATOMIC_ACQ_REL);
+        for (block = head; block; block = next) {
+            next = block->next_free;
+            size += MBLOCK_GET_SIZE(block);
+            mblock_free(tpool, block);    
+        }
+    }
+   
+    return size; 
+}
+
+static inline void mblock_push_remote(struct mblock* block)
+{
+    struct mslice* slice = block->owner;
+    struct mblock* head;
+    
+    MDBG("push remote block %p", block);
+    do {
+        head = (struct mblock *)slice->free_list;
+        block->next_free = (struct mblock *)slice->free_list;
+    } while (!mpool_atomic_cas(&slice->free_list, &head, block,
+        1, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
+}
+#endif //MPOOL_MT
 
 #ifdef __cplusplus
 }

@@ -7,6 +7,13 @@ MPOOL_1.0.0 {
         mpool_free;
         mpool_calloc;
         mpool_calloc_align;
+
+        mpool_alloc_mt;
+        mpool_alloc_align_mt;
+        mpool_free_mt;
+        mpool_calloc_mt;
+        mpool_calloc_align_mt;
+        mpool_cleanup_mt;
    
     local:*;
 };
